@@ -35,7 +35,7 @@ YA_BASE = "https://webdav.yandex.ru"
 import subprocess
 subprocess.run(["pip", "install", "requests", "-q"])
 
-import requests, os, json
+import requests, os, json, time
 from pathlib import PurePosixPath
 from urllib.parse import quote
 from requests.auth import HTTPBasicAuth
@@ -44,51 +44,67 @@ YA_AUTH   = HTTPBasicAuth(YA_LOGIN, YA_APP_PASSWORD)
 MR        = requests.Session()
 MR.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+MAX_RETRIES = 4        # попыток на файл
+RETRY_WAIT  = 15       # секунд между попытками
+CONNECT_TMO = 30       # таймаут соединения, сек
+READ_TMO    = 7200     # таймаут чтения для огромных файлов (2 ч)
+
 # ── Яндекс.Диск: создание папок ───────────────────────────────────────────────
 def ya_mkdirs(path):
-    """Создаёт все уровни папок (как mkdir -p)"""
     parts = path.strip("/").split("/")
     for i in range(1, len(parts) + 1):
         partial = "/".join(parts[:i])
-        requests.request("MKCOL", f"{YA_BASE}/{partial}", auth=YA_AUTH)
+        requests.request("MKCOL", f"{YA_BASE}/{partial}", auth=YA_AUTH,
+                         timeout=(CONNECT_TMO, 60))
+
+# ── Яндекс.Диск: проверить, существует ли файл ───────────────────────────────
+def ya_exists(remote_path):
+    encoded = quote(remote_path.lstrip("/"), safe="/")
+    r = requests.request("HEAD", f"{YA_BASE}/{encoded}", auth=YA_AUTH,
+                         timeout=(CONNECT_TMO, 30))
+    return r.status_code in (200, 204)
 
 # ── Яндекс.Диск: стриминговая загрузка ───────────────────────────────────────
 def ya_upload_stream(remote_path, mr_download_url, size):
-    """Скачивает во временный файл, потом заливает на Яндекс"""
     encoded_path = quote(remote_path.lstrip("/"), safe="/")
     tmp = "/tmp/_mr_transfer"
 
     # 1. Скачиваем с Mail.ru
-    with MR.get(mr_download_url, stream=True) as src:
+    with MR.get(mr_download_url, stream=True,
+                timeout=(CONNECT_TMO, READ_TMO)) as src:
         src.raise_for_status()
         with open(tmp, "wb") as fh:
             for chunk in src.iter_content(8 * 1024 * 1024):
                 fh.write(chunk)
 
-    # 2. Загружаем на Яндекс.Диск из файла (надёжнее генератора)
+    # 2. Загружаем на Яндекс.Диск
     actual = os.path.getsize(tmp)
-    with open(tmp, "rb") as fh:
-        r = requests.put(
-            f"{YA_BASE}/{encoded_path}",
-            auth=YA_AUTH,
-            data=fh,
-            headers={
-                "Content-Length": str(actual),
-                "Content-Type": "application/octet-stream",
-                "Overwrite":     "T",
-            },
-        )
-    os.remove(tmp)
+    try:
+        with open(tmp, "rb") as fh:
+            r = requests.put(
+                f"{YA_BASE}/{encoded_path}",
+                auth=YA_AUTH,
+                data=fh,
+                headers={
+                    "Content-Length": str(actual),
+                    "Content-Type":   "application/octet-stream",
+                    "Overwrite":      "T",
+                },
+                timeout=(CONNECT_TMO, READ_TMO),
+            )
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return r.status_code
 
 # ── Mail.ru: получить сервер загрузки ─────────────────────────────────────────
 def mr_dispatcher():
     from urllib.parse import urlparse
-    r = MR.get("https://cloud.mail.ru/api/v2/dispatcher", params={"api": 2})
+    r = MR.get("https://cloud.mail.ru/api/v2/dispatcher", params={"api": 2},
+               timeout=(CONNECT_TMO, 30))
     raw = r.json()["body"]["weblink_get"][0]["url"]
-    # API теперь возвращает полный путь вместо просто хоста — берём только схему+хост
     p = urlparse(raw)
-    return f"{p.scheme}://{p.netloc}/" 
+    return f"{p.scheme}://{p.netloc}/"
 
 # ── Mail.ru: список файлов в папке ────────────────────────────────────────────
 def mr_list_folder(weblink):
@@ -101,7 +117,7 @@ def mr_list_folder(weblink):
             "api":     2,
             "sort[type]":  "name",
             "sort[order]": "asc",
-        })
+        }, timeout=(CONNECT_TMO, 60))
         body  = r.json().get("body", {})
         batch = body.get("list", [])
         if not batch:
@@ -109,7 +125,7 @@ def mr_list_folder(weblink):
         items  += batch
         offset += len(batch)
         count   = body.get("count", 0)
-        if isinstance(count, dict):          # новая структура: {"total": N, ...}
+        if isinstance(count, dict):
             count = count.get("total", count.get("value", 0))
         if not batch or offset >= count:
             break
@@ -134,7 +150,8 @@ def mr_collect_files(weblink, prefix=""):
 print("🔐 Проверка Яндекс.Диска...")
 probe = requests.request(
     "PROPFIND", f"{YA_BASE}/",
-    auth=YA_AUTH, headers={"Depth": "0"}
+    auth=YA_AUTH, headers={"Depth": "0"},
+    timeout=(CONNECT_TMO, 60),
 )
 if probe.status_code not in (200, 207):
     raise SystemExit(f"❌ Яндекс.Диск: ошибка {probe.status_code} — проверь логин/пароль приложения")
@@ -155,28 +172,49 @@ print(f"   Найдено: {len(files)} файлов, ~{total_gb:.2f} ГБ")
 ya_mkdirs(YA_DEST_FOLDER)
 
 errors = []
+skipped = 0
 for i, f in enumerate(files, 1):
     dest_path   = f"{YA_DEST_FOLDER}{f['path']}"
     parent_path = str(PurePosixPath(dest_path).parent)
-    ya_mkdirs(parent_path)
-
-    download_url = dispatcher + "weblink/view/" + quote(f["weblink"], safe="/+")
     mb = f["size"] / 1024 ** 2
-    print(f"[{i:>3}/{len(files)}] {f['path']}  ({mb:.1f} МБ)", end=" … ", flush=True)
+    label = f"[{i:>3}/{len(files)}] {f['path']}  ({mb:.1f} МБ)"
 
-    try:
-        code = ya_upload_stream(dest_path, download_url, f["size"])
-        if code in (200, 201, 204):
-            print("✅")
-        else:
-            print(f"⚠️  HTTP {code}")
-            errors.append(f["path"])
-    except Exception as e:
-        print(f"❌ {e}")
+    # пропускаем уже загруженные файлы
+    if ya_exists(dest_path):
+        print(f"{label} … ⏭ уже есть")
+        skipped += 1
+        continue
+
+    ya_mkdirs(parent_path)
+    download_url = dispatcher + "weblink/view/" + quote(f["weblink"], safe="/+")
+
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        suffix = f" (попытка {attempt}/{MAX_RETRIES})" if attempt > 1 else ""
+        print(f"{label}{suffix}", end=" … ", flush=True)
+        try:
+            code = ya_upload_stream(dest_path, download_url, f["size"])
+            if code in (200, 201, 204):
+                print("✅")
+                last_exc = None
+                break
+            else:
+                print(f"⚠️  HTTP {code}")
+                last_exc = f"HTTP {code}"
+                break
+        except Exception as e:
+            last_exc = e
+            print(f"❌ {e}")
+            if attempt < MAX_RETRIES:
+                print(f"    ⟳ повтор через {RETRY_WAIT}с...")
+                time.sleep(RETRY_WAIT)
+
+    if last_exc:
         errors.append(f["path"])
 
 print(f"\n{'─'*50}")
-print(f"🎉 Готово. Успешно: {len(files)-len(errors)}/{len(files)}")
+print(f"🎉 Готово. Успешно: {len(files)-len(errors)-skipped}/{len(files)}  "
+      f"(пропущено/уже было: {skipped}, ошибок: {len(errors)})")
 print(f"📁 Папка на Яндекс.Диске: /{YA_DEST_FOLDER}")
 
 if errors:
