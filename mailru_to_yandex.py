@@ -12,6 +12,7 @@ import os as _os, re as _re
 # ─── Colab: меняй здесь / GitHub Actions: подставляется из env автоматически ─
 YA_LOGIN          = "Fyodor.02@yandex.ru"                          #@param {type:"string"}
 YA_APP_PASSWORD   = ""                                             #@param {type:"string"}
+YA_OAUTH_TOKEN    = ""                                             #@param {type:"string"}
 MAILRU_PUBLIC_URL = "https://cloud.mail.ru/public/Rs3w/mCfhSqGXE"  #@param {type:"string"}
 YA_DEST_FOLDER    = ""                                              #@param {type:"string"}
 # Оставь YA_DEST_FOLDER пустым — имя папки возьмётся из ссылки автоматически
@@ -19,6 +20,7 @@ YA_DEST_FOLDER    = ""                                              #@param {typ
 # env-переменные перекрывают хардкод (нужно для GitHub Actions)
 YA_LOGIN          = _os.environ.get("YA_LOGIN",          YA_LOGIN)
 YA_APP_PASSWORD   = _os.environ.get("YA_APP_PASSWORD",   YA_APP_PASSWORD)
+YA_OAUTH_TOKEN    = _os.environ.get("YA_OAUTH_TOKEN",    YA_OAUTH_TOKEN).strip()
 MAILRU_PUBLIC_URL = _os.environ.get("MAILRU_PUBLIC_URL", MAILRU_PUBLIC_URL).strip()
 YA_DEST_FOLDER    = _os.environ.get("YA_DEST_FOLDER",    YA_DEST_FOLDER).strip()
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,79 +31,127 @@ if not _match:
 MAILRU_WEBLINK = _match.group(1)
 if not YA_DEST_FOLDER:
     YA_DEST_FOLDER = "mailru_" + MAILRU_WEBLINK.replace("/", "_")
-YA_BASE = "https://webdav.yandex.ru"
 
 # ── Зависимости ───────────────────────────────────────────────────────────────
 import subprocess
 subprocess.run(["pip", "install", "requests", "-q"])
 
-import requests, os, json, time
+import requests, os, time
 from pathlib import PurePosixPath
 from urllib.parse import quote
 from requests.auth import HTTPBasicAuth
 
-YA_AUTH   = HTTPBasicAuth(YA_LOGIN, YA_APP_PASSWORD)
-MR        = requests.Session()
+YA_AUTH        = HTTPBasicAuth(YA_LOGIN, YA_APP_PASSWORD)
+YA_REST        = "https://cloud-api.yandex.net/v1/disk"
+YA_WEBDAV      = "https://webdav.yandex.ru"
+REST_HEADERS   = {"Authorization": f"OAuth {YA_OAUTH_TOKEN}"}
+
+MR = requests.Session()
 MR.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-MAX_RETRIES = 4        # попыток на файл
-RETRY_WAIT  = 15       # секунд между попытками
-CONNECT_TMO = 30       # таймаут соединения, сек
-READ_TMO    = 7200     # таймаут чтения для огромных файлов (2 ч)
+MAX_RETRIES = 4
+RETRY_WAIT  = 15
+CONNECT_TMO = 30
+READ_TMO    = 7200
+
+USE_REST = bool(YA_OAUTH_TOKEN)
 
 # ── Яндекс.Диск: создание папок ───────────────────────────────────────────────
 def ya_mkdirs(path):
     parts = path.strip("/").split("/")
     for i in range(1, len(parts) + 1):
         partial = "/".join(parts[:i])
-        requests.request("MKCOL", f"{YA_BASE}/{partial}", auth=YA_AUTH,
+        if USE_REST:
+            requests.put(f"{YA_REST}/resources",
+                         headers=REST_HEADERS,
+                         params={"path": f"disk:/{partial}"},
                          timeout=(CONNECT_TMO, 60))
+        else:
+            requests.request("MKCOL", f"{YA_WEBDAV}/{partial}",
+                             auth=YA_AUTH, timeout=(CONNECT_TMO, 60))
 
 # ── Яндекс.Диск: проверить, существует ли файл ───────────────────────────────
 def ya_exists(remote_path):
-    encoded = quote(remote_path.lstrip("/"), safe="/")
-    r = requests.request("HEAD", f"{YA_BASE}/{encoded}", auth=YA_AUTH,
+    if USE_REST:
+        r = requests.get(f"{YA_REST}/resources",
+                         headers=REST_HEADERS,
+                         params={"path": f"disk:/{remote_path.lstrip('/')}"},
                          timeout=(CONNECT_TMO, 30))
-    return r.status_code in (200, 204)
+        return r.status_code == 200
+    else:
+        encoded = quote(remote_path.lstrip("/"), safe="/")
+        r = requests.request("HEAD", f"{YA_WEBDAV}/{encoded}",
+                             auth=YA_AUTH, timeout=(CONNECT_TMO, 30))
+        return r.status_code in (200, 204)
 
-# ── Яндекс.Диск: стриминговая загрузка ───────────────────────────────────────
-def ya_upload_stream(remote_path, mr_download_url, size):
-    encoded_path = quote(remote_path.lstrip("/"), safe="/")
-    tmp = "/tmp/_mr_transfer"
+# ── Яндекс.Диск: загрузить локальный файл ────────────────────────────────────
+def ya_upload_file(remote_path, local_path):
+    actual = os.path.getsize(local_path)
+    if USE_REST:
+        # Получаем presigned URL — нет ограничений по времени соединения
+        r = requests.get(f"{YA_REST}/resources/upload",
+                         headers=REST_HEADERS,
+                         params={"path": f"disk:/{remote_path.lstrip('/')}", "overwrite": "true"},
+                         timeout=(CONNECT_TMO, 60))
+        r.raise_for_status()
+        upload_url = r.json()["href"]
+        with open(local_path, "rb") as fh:
+            r = requests.put(upload_url, data=fh,
+                             headers={"Content-Length": str(actual)},
+                             timeout=(CONNECT_TMO, READ_TMO))
+    else:
+        encoded = quote(remote_path.lstrip("/"), safe="/")
+        with open(local_path, "rb") as fh:
+            r = requests.put(f"{YA_WEBDAV}/{encoded}",
+                             auth=YA_AUTH, data=fh,
+                             headers={"Content-Length": str(actual),
+                                      "Content-Type": "application/octet-stream",
+                                      "Overwrite": "T"},
+                             timeout=(CONNECT_TMO, READ_TMO))
+    return r.status_code
 
-    # 1. Скачиваем с Mail.ru
-    with MR.get(mr_download_url, stream=True,
-                timeout=(CONNECT_TMO, READ_TMO)) as src:
+# ── Скачать с Mail.ru во временный файл ──────────────────────────────────────
+def mr_download(url, tmp):
+    with MR.get(url, stream=True, timeout=(CONNECT_TMO, READ_TMO)) as src:
         src.raise_for_status()
         with open(tmp, "wb") as fh:
             for chunk in src.iter_content(8 * 1024 * 1024):
                 fh.write(chunk)
 
-    # 2. Загружаем на Яндекс.Диск
-    actual = os.path.getsize(tmp)
+# ── Полный цикл: скачать + загрузить (раздельные ретраи) ─────────────────────
+def transfer(remote_path, mr_download_url, size):
+    tmp = "/tmp/_mr_transfer"
+
+    # 1. Скачиваем с Mail.ru (с ретраями)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            mr_download(mr_download_url, tmp)
+            break
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                raise
+            print(f"\n    ⟳ download {attempt+1}/{MAX_RETRIES} через {RETRY_WAIT}с: {e}", flush=True)
+            time.sleep(RETRY_WAIT)
+
+    # 2. Загружаем на Яндекс (с ретраями, без повторного скачивания)
     try:
-        with open(tmp, "rb") as fh:
-            r = requests.put(
-                f"{YA_BASE}/{encoded_path}",
-                auth=YA_AUTH,
-                data=fh,
-                headers={
-                    "Content-Length": str(actual),
-                    "Content-Type":   "application/octet-stream",
-                    "Overwrite":      "T",
-                },
-                timeout=(CONNECT_TMO, READ_TMO),
-            )
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return ya_upload_file(remote_path, tmp)
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    raise
+                print(f"\n    ⟳ upload {attempt+1}/{MAX_RETRIES} через {RETRY_WAIT}с: {e}", flush=True)
+                time.sleep(RETRY_WAIT)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    return r.status_code
 
 # ── Mail.ru: получить сервер загрузки ─────────────────────────────────────────
 def mr_dispatcher():
     from urllib.parse import urlparse
-    r = MR.get("https://cloud.mail.ru/api/v2/dispatcher", params={"api": 2},
-               timeout=(CONNECT_TMO, 30))
+    r = MR.get("https://cloud.mail.ru/api/v2/dispatcher",
+               params={"api": 2}, timeout=(CONNECT_TMO, 30))
     raw = r.json()["body"]["weblink_get"][0]["url"]
     p = urlparse(raw)
     return f"{p.scheme}://{p.netloc}/"
@@ -111,12 +161,8 @@ def mr_list_folder(weblink):
     items, offset = [], 0
     while True:
         r = MR.get("https://cloud.mail.ru/api/v2/folder", params={
-            "weblink": weblink,
-            "offset":  offset,
-            "limit":   500,
-            "api":     2,
-            "sort[type]":  "name",
-            "sort[order]": "asc",
+            "weblink": weblink, "offset": offset, "limit": 500, "api": 2,
+            "sort[type]": "name", "sort[order]": "asc",
         }, timeout=(CONNECT_TMO, 60))
         body  = r.json().get("body", {})
         batch = body.get("list", [])
@@ -137,25 +183,28 @@ def mr_collect_files(weblink, prefix=""):
     for item in mr_list_folder(weblink):
         rel_path = prefix + "/" + item["name"]
         if item["type"] == "file":
-            result.append({
-                "weblink": item["weblink"],
-                "path":    rel_path,
-                "size":    item.get("size", 0),
-            })
+            result.append({"weblink": item["weblink"],
+                           "path": rel_path, "size": item.get("size", 0)})
         elif item["type"] == "folder":
             result += mr_collect_files(item["weblink"], rel_path)
     return result
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 print("🔐 Проверка Яндекс.Диска...")
-probe = requests.request(
-    "PROPFIND", f"{YA_BASE}/",
-    auth=YA_AUTH, headers={"Depth": "0"},
-    timeout=(CONNECT_TMO, 60),
-)
-if probe.status_code not in (200, 207):
-    raise SystemExit(f"❌ Яндекс.Диск: ошибка {probe.status_code} — проверь логин/пароль приложения")
-print("✅ Авторизация OK")
+if USE_REST:
+    probe = requests.get(f"{YA_REST}/", headers=REST_HEADERS,
+                         timeout=(CONNECT_TMO, 30))
+    ok = probe.status_code == 200
+else:
+    probe = requests.request("PROPFIND", f"{YA_WEBDAV}/",
+                             auth=YA_AUTH, headers={"Depth": "0"},
+                             timeout=(CONNECT_TMO, 60))
+    ok = probe.status_code in (200, 207)
+
+if not ok:
+    raise SystemExit(f"❌ Яндекс.Диск: ошибка {probe.status_code} — проверь токен/логин")
+mode = "REST API (OAuth)" if USE_REST else "WebDAV"
+print(f"✅ Авторизация OK  [{mode}]")
 
 print("📡 Получаем сервер загрузки Mail.ru...")
 dispatcher = mr_dispatcher()
@@ -171,15 +220,13 @@ print(f"   Найдено: {len(files)} файлов, ~{total_gb:.2f} ГБ")
 
 ya_mkdirs(YA_DEST_FOLDER)
 
-errors = []
-skipped = 0
+errors, skipped = [], 0
 for i, f in enumerate(files, 1):
     dest_path   = f"{YA_DEST_FOLDER}{f['path']}"
     parent_path = str(PurePosixPath(dest_path).parent)
-    mb = f["size"] / 1024 ** 2
+    mb    = f["size"] / 1024 ** 2
     label = f"[{i:>3}/{len(files)}] {f['path']}  ({mb:.1f} МБ)"
 
-    # пропускаем уже загруженные файлы
     if ya_exists(dest_path):
         print(f"{label} … ⏭ уже есть")
         skipped += 1
@@ -188,28 +235,16 @@ for i, f in enumerate(files, 1):
     ya_mkdirs(parent_path)
     download_url = dispatcher + "weblink/view/" + quote(f["weblink"], safe="/+")
 
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        suffix = f" (попытка {attempt}/{MAX_RETRIES})" if attempt > 1 else ""
-        print(f"{label}{suffix}", end=" … ", flush=True)
-        try:
-            code = ya_upload_stream(dest_path, download_url, f["size"])
-            if code in (200, 201, 204):
-                print("✅")
-                last_exc = None
-                break
-            else:
-                print(f"⚠️  HTTP {code}")
-                last_exc = f"HTTP {code}"
-                break
-        except Exception as e:
-            last_exc = e
-            print(f"❌ {e}")
-            if attempt < MAX_RETRIES:
-                print(f"    ⟳ повтор через {RETRY_WAIT}с...")
-                time.sleep(RETRY_WAIT)
-
-    if last_exc:
+    print(label, end=" … ", flush=True)
+    try:
+        code = transfer(dest_path, download_url, f["size"])
+        if code in (200, 201, 204):
+            print("✅")
+        else:
+            print(f"⚠️  HTTP {code}")
+            errors.append(f["path"])
+    except Exception as e:
+        print(f"❌ {e}")
         errors.append(f["path"])
 
 print(f"\n{'─'*50}")

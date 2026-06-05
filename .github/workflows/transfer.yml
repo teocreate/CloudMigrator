@@ -27,6 +27,7 @@ jobs:
         env:
           YA_LOGIN:         ${{ secrets.YA_LOGIN }}
           YA_APP_PASSWORD:  ${{ secrets.YA_APP_PASSWORD }}
+          YA_OAUTH_TOKEN:   ${{ secrets.YA_OAUTH_TOKEN }}
           MAILRU_PUBLIC_URL: ${{ inputs.mailru_url }}
           YA_DEST_FOLDER:   ${{ inputs.dest_folder }}
         run: python mailru_to_yandex.py
