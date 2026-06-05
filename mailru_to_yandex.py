@@ -11,7 +11,7 @@ import os as _os, re as _re
 
 # ─── Colab: меняй здесь / GitHub Actions: подставляется из env автоматически ─
 YA_LOGIN          = "Fyodor.02@yandex.ru"                          #@param {type:"string"}
-YA_APP_PASSWORD   = "anedcmdknofsdcnb"                             #@param {type:"string"}
+YA_APP_PASSWORD   = ""                                             #@param {type:"string"}
 MAILRU_PUBLIC_URL = "https://cloud.mail.ru/public/Rs3w/mCfhSqGXE"  #@param {type:"string"}
 YA_DEST_FOLDER    = ""                                              #@param {type:"string"}
 # Оставь YA_DEST_FOLDER пустым — имя папки возьмётся из ссылки автоматически
