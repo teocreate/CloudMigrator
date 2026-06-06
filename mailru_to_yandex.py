@@ -88,7 +88,7 @@ def ya_exists(remote_path):
 def ya_upload_file(remote_path, local_path):
     actual = os.path.getsize(local_path)
     if USE_REST:
-        # Получаем presigned URL — нет ограничений по времени соединения
+        # Получаем presigned URL
         r = requests.get(f"{YA_REST}/resources/upload",
                          headers=REST_HEADERS,
                          params={"path": f"disk:/{remote_path.lstrip('/')}", "overwrite": "true"},
@@ -98,7 +98,7 @@ def ya_upload_file(remote_path, local_path):
         with open(local_path, "rb") as fh:
             r = requests.put(upload_url, data=fh,
                              headers={"Content-Length": str(actual)},
-                             timeout=(CONNECT_TMO, READ_TMO))
+                             timeout=(60, None))  # None = без таймаута на запись
     else:
         encoded = quote(remote_path.lstrip("/"), safe="/")
         with open(local_path, "rb") as fh:
