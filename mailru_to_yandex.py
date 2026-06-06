@@ -220,17 +220,31 @@ print(f"   Найдено: {len(files)} файлов, ~{total_gb:.2f} ГБ")
 
 ya_mkdirs(YA_DEST_FOLDER)
 
-errors, skipped = [], 0
+print(f"\n🔍 Проверяем наличие файлов на Яндекс.Диске ({len(files)} шт.)...")
+to_transfer, skipped = [], 0
 for i, f in enumerate(files, 1):
-    dest_path   = f"{YA_DEST_FOLDER}{f['path']}"
+    dest_path = f"{YA_DEST_FOLDER}{f['path']}"
+    if ya_exists(dest_path):
+        skipped += 1
+    else:
+        to_transfer.append(dict(f, dest_path=dest_path))
+    if i % 10 == 0 or i == len(files):
+        print(f"   [{i}/{len(files)}] проверено — уже есть: {skipped}, нужно перенести: {len(to_transfer)}", flush=True)
+
+need_gb = sum(f["size"] for f in to_transfer) / 1024 ** 3
+print(f"\n📋 К переносу: {len(to_transfer)} файлов ({need_gb:.2f} ГБ)  |  уже есть: {skipped}")
+
+if not to_transfer:
+    print("🎉 Все файлы уже на Яндекс.Диске!")
+    raise SystemExit(0)
+
+print()
+errors = []
+for i, f in enumerate(to_transfer, 1):
+    dest_path   = f["dest_path"]
     parent_path = str(PurePosixPath(dest_path).parent)
     mb    = f["size"] / 1024 ** 2
-    label = f"[{i:>3}/{len(files)}] {f['path']}  ({mb:.1f} МБ)"
-
-    if ya_exists(dest_path):
-        print(f"{label} … ⏭ уже есть")
-        skipped += 1
-        continue
+    label = f"[{i:>3}/{len(to_transfer)}] {f['path']}  ({mb:.1f} МБ)"
 
     ya_mkdirs(parent_path)
     download_url = dispatcher + "weblink/view/" + quote(f["weblink"], safe="/+")
@@ -248,7 +262,7 @@ for i, f in enumerate(files, 1):
         errors.append(f["path"])
 
 print(f"\n{'─'*50}")
-print(f"🎉 Готово. Успешно: {len(files)-len(errors)-skipped}/{len(files)}  "
+print(f"🎉 Готово. Успешно: {len(to_transfer)-len(errors)}/{len(to_transfer)}  "
       f"(пропущено/уже было: {skipped}, ошибок: {len(errors)})")
 print(f"📁 Папка на Яндекс.Диске: /{YA_DEST_FOLDER}")
 
